@@ -1,10 +1,8 @@
 # coding=utf-8
-# Copyright 2024 
+# Copyright 2023 All rights reserved.
 #
-# This code is based on EleutherAI's GPT-NeoX library and the GPT-NeoX
-# and OPT implementations in this library. It has been modified from its
-# original forms to accommodate minor architectural differences compared
-# to GPT-NeoX and OPT used by the Meta AI team that trained the model.
+# This code is based on Mixtral model from Mistral AI team. It has been modified from its
+# original forms to accommodate minor architectural differences compared to Mixtral.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -152,22 +150,7 @@ def load_balancing_loss_func(
     return overall_loss * num_experts
 
 
-class ModuMixRouter(nn.Module):
-    def __init__(self, hidden_size, num_experts):
-        super().__init__()
-        self.gate = nn.Linear(hidden_size, num_experts, bias=False)
-    
-    def forward(self, embeddings, active_experts):
-        router_logits = self.gate(embeddings)
-        # Mask out inactive experts
-        for idx in range(router_logits.shape[-1]):
-            if idx not in active_experts:
-                router_logits[:, idx] = float('-inf')
-        routing_probs = F.softmax(router_logits, dim=-1)
-        return routing_probs
-
-
-# Copied from transformers.models.llama.modeling_llama.LlamaRMSNorm with Llama->Modumix
+# Copied from transformers.models.mixtral.modeling_mixtral.MixtralRMSNorm with Mixtral->Modumix
 class ModumixRMSNorm(nn.Module):
     def __init__(self, hidden_size, eps=1e-6):
         """
@@ -226,7 +209,7 @@ class ModumixRotaryEmbedding(nn.Module):
         )
 
 
-# Copied from transformers.models.llama.modeling_llama.rotate_half
+# Copied from transformers.models.mixtral.modeling_mixtral.rotate_half
 def rotate_half(x):
     """Rotates half the hidden dims of the input."""
     x1 = x[..., : x.shape[-1] // 2]
@@ -264,7 +247,7 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids, unsqueeze_dim=1):
     return q_embed, k_embed
 
 
-# Copied from transformers.models.llama.modeling_llama.repeat_kv
+# Copied from transformers.models.mixtral.modeling_mixtral.repeat_kv
 def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     """
     This is the equivalent of torch.repeat_interleave(x, dim=1, repeats=n_rep). The hidden states go from (batch,
@@ -618,15 +601,23 @@ class ModumixBlockSparseTop2MLP(nn.Module):
 
 
 class ModumixSparseMoeBlock(nn.Module):
+    # TODO: add the option to choose the routing level (token or sequence)
     """
-    This implementation is
-    strictly equivalent to standard MoE with full capacity (no
-    dropped tokens). It's faster since it formulates MoE operations
-    in terms of block-sparse operations to accommodate imbalanced
-    assignments of tokens to experts, whereas standard MoE either
-    (1) drop tokens at the cost of reduced performance or (2) set
-    capacity factor to number of experts and thus waste computation
-    and memory on padding.
+    Modumix Sparse Mixture of Experts Block.
+    This implementation performs sequence-level routing instead of token-level routing.
+    During training, sequence labels are used as ground truth to train the router.
+    A common expert can be optionally included, which always processes the input sequence.
+    The aggregation method of the expert outputs can be configured.
+
+    Parameters:
+        config: Configuration object with the following attributes:
+            hidden_size: int, size of the hidden representations.
+            intermediate_size: int, size of the feed-forward network hidden layer.
+            num_local_experts: int, number of experts in the MoE layer.
+            num_experts_per_seq: int, number of experts to route each sequence to.
+            router_jitter_noise: float, amount of jitter noise to apply during training.
+            use_common_expert: bool, whether to include a common expert.
+            aggregation_method: str, method to aggregate expert outputs ('sum', 'mean', 'learned').
     """
 
     def __init__(self, config):
@@ -634,58 +625,100 @@ class ModumixSparseMoeBlock(nn.Module):
         self.hidden_dim = config.hidden_size
         self.ffn_dim = config.intermediate_size
         self.num_experts = config.num_local_experts
-        self.top_k = config.num_experts_per_seq  # Change to sequence-level
+        self.top_k = config.num_experts_per_seq  # Number of experts per sequence
 
-        # gating
+        # Gating mechanism
         self.gate = nn.Linear(self.hidden_dim, self.num_experts, bias=False)
 
         self.experts = nn.ModuleList([ModumixBlockSparseTop2MLP(config) for _ in range(self.num_experts)])
 
-        # Jitter parameters
-        self.jitter_noise = config.router_jitter_noise
+        # Common expert (configurable)
+        self.use_common_expert = getattr(config, 'use_common_expert', False)
+        if self.use_common_expert:
+            self.common_expert = ModumixBlockSparseTop2MLP(config)
+        else:
+            self.common_expert = None
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """ """
+        # Aggregation method (configurable)
+        self.aggregation_method = getattr(config, 'aggregation_method', 'sum')  # Default to 'sum'
+        if self.aggregation_method == 'learned' and self.use_common_expert:
+            # The aggregation layer maps concatenated outputs to hidden_dim
+            self.aggregation_layer = nn.Linear(self.hidden_dim * 2, self.hidden_dim)
+        else:
+            self.aggregation_layer = None
+
+        # Jitter parameters
+        self.jitter_noise = getattr(config, 'router_jitter_noise', 0.0)
+
+    def forward(self, hidden_states: torch.Tensor, seq_labels: Optional[torch.Tensor] = None):
+        """
+        Forward pass of the ModumixSparseMoeBlock.
+
+        Args:
+            hidden_states: Tensor of shape (batch_size, sequence_length, hidden_dim)
+            seq_labels: Optional tensor of shape (batch_size,), sequence labels for training the router.
+
+        Returns:
+            final_hidden_states: Tensor of shape (batch_size, sequence_length, hidden_dim)
+            router_logits: Tensor of shape (batch_size, num_experts)
+            router_loss: Scalar tensor, cross-entropy loss for the router (if seq_labels are provided during training)
+        """
         batch_size, sequence_length, hidden_dim = hidden_states.shape
         if self.training and self.jitter_noise > 0:
             hidden_states *= torch.empty_like(hidden_states).uniform_(1.0 - self.jitter_noise, 1.0 + self.jitter_noise)
-        
-        # Compute sequence-level representations (e.g., mean pooling)
-        sequence_representations = hidden_states.mean(dim=1)  # Shape: (batch_size, hidden_dim)
-        
-        # router_logits: (batch_size, n_experts)
-        router_logits = self.gate(sequence_representations)
 
-        routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
-        routing_weights, selected_experts = torch.topk(routing_weights, self.top_k, dim=-1)
-        routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
-        # we cast back to the input dtype
-        routing_weights = routing_weights.to(hidden_states.dtype)
+        # Compute sequence-level representation
+        sequence_representation = hidden_states.mean(dim=1)  # Shape: (batch_size, hidden_dim)
 
-        final_hidden_states = torch.zeros(
-            (batch_size, sequence_length, hidden_dim), dtype=hidden_states.dtype, device=hidden_states.device
-        )
+        # Compute router logits
+        router_logits = self.gate(sequence_representation)  # Shape: (batch_size, num_experts)
 
-        # One hot encode the selected experts to create an expert mask
-        # this will be used to easily index which expert is going to be solicited
-        expert_mask = torch.nn.functional.one_hot(selected_experts, num_classes=self.num_experts).permute(1, 0)
+        # Compute router loss during training
+        if self.training and seq_labels is not None:
+            router_loss = F.cross_entropy(router_logits, seq_labels)
+        else:
+            router_loss = None
 
-        # Loop over all available experts in the model and perform the computation on each expert
+        # Compute routing weights
+        # TODO: will we use routing weights ?
+        routing_weights = F.softmax(router_logits, dim=-1)  # Shape: (batch_size, num_experts)
+
+        # Select top_k experts
+        _, selected_experts = torch.topk(routing_weights, self.top_k, dim=-1)  # Shape: (batch_size, top_k)
+
+        # Create selection mask
+        selection_mask = torch.zeros(batch_size, self.num_experts, dtype=torch.bool, device=hidden_states.device)
+        selection_mask.scatter_(1, selected_experts, True)
+
+        final_hidden_states = torch.zeros_like(hidden_states)
+
+        # Process each expert
         for expert_idx in range(self.num_experts):
-            expert_layer = self.experts[expert_idx]
-            idx = torch.where(expert_mask[expert_idx])[0]
+            mask = selection_mask[:, expert_idx]  # Shape: (batch_size,)
+            batch_indices = mask.nonzero(as_tuple=True)[0]
+            if batch_indices.numel() == 0:
+                continue
+            current_hidden_states = hidden_states[batch_indices]  # Shape: (num_sequences, seq_len, hidden_dim)
+            expert_output = self.experts[expert_idx](current_hidden_states)  # Shape: (num_sequences, seq_len, hidden_dim)
+            # TODO: will we use routing weights ?
+            weights = routing_weights[batch_indices, expert_idx].unsqueeze(-1).unsqueeze(-1)  # Shape: (num_sequences, 1, 1)
+            expert_output = expert_output * weights
+            final_hidden_states[batch_indices] += expert_output
 
-            # Index the correct hidden states and compute the expert hidden state for
-            # the current expert. We need to make sure to multiply the output hidden
-            # states by `routing_weights` on the corresponding sequences
-            current_state = hidden_states[idx]  # Shape: (num_selected_sequences, sequence_length, hidden_dim)
-            current_hidden_states = expert_layer(current_state) * routing_weights[idx, expert_idx, None, None]
+        # Process common expert if enabled
+        if self.use_common_expert:
+            common_output = self.common_expert(hidden_states)  # Shape: (batch_size, seq_len, hidden_dim)
+            if self.aggregation_method == 'sum':
+                final_hidden_states += common_output
+            elif self.aggregation_method == 'mean':
+                final_hidden_states = (final_hidden_states + common_output) / 2
+            elif self.aggregation_method == 'learned':
+                combined_output = torch.cat([final_hidden_states, common_output], dim=-1)  # Shape: (batch_size, seq_len, hidden_dim * 2)
+                final_hidden_states = self.aggregation_layer(combined_output)  # Shape: (batch_size, seq_len, hidden_dim)
+            else:
+                raise ValueError(f"Invalid aggregation method: {self.aggregation_method}")
 
-            # However `index_add_` only supports torch tensors for indexing so we'll use
-            # the `idx` tensor here.
-            final_hidden_states.index_add_(0, idx, current_hidden_states.to(hidden_states.dtype))
-        
-        return final_hidden_states, router_logits
+        return final_hidden_states, router_logits, router_loss
 
 
 class ModumixDecoderLayer(nn.Module):
@@ -752,7 +785,7 @@ class ModumixDecoderLayer(nn.Module):
         # Fully Connected
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states, router_logits = self.block_sparse_moe(hidden_states)
+        hidden_states, router_logits, router_loss = self.block_sparse_moe(hidden_states)
         hidden_states = residual + hidden_states
 
         outputs = (hidden_states,)
@@ -766,6 +799,7 @@ class ModumixDecoderLayer(nn.Module):
         if output_router_logits:
             outputs += (router_logits,)
 
+        # TODO: return router_loss only during training
         return outputs
 
 
@@ -884,32 +918,6 @@ MODUMIX_INPUTS_DOCSTRING = r"""
             the complete sequence length.
 """
 
-class ExpertManager:
-    def __init__(self):
-        self.experts = {}
-    
-    def add_expert(self, expert_name, expert_model):
-        self.experts[expert_name] = expert_model
-        
-    def remove_expert(self, expert_name):
-        del self.experts[expert_name]
-    
-    def forward(self, embeddings, selected_expert_idx):
-        # Get the expert corresponding to the selected index
-        expert_name = list(self.experts.keys())[selected_expert_idx]
-        expert_model = self.experts[expert_name]
-        return expert_model(embeddings)
-    
-    def save_expert(self, expert_name, save_path):
-        expert_model = self.experts[expert_name]
-        torch.save(expert_model.state_dict(), save_path)
-    
-    def load_expert(self, expert_name, load_path):
-        expert_model = ModuMixExpert(self.config)
-        expert_model.load_state_dict(torch.load(load_path))
-        self.add_expert(expert_name, expert_model)
-
-
 
 @add_start_docstrings(
     "The bare Modumix Model outputting raw hidden-states without any specific head on top.",
@@ -927,13 +935,10 @@ class ModumixModel(ModumixPreTrainedModel):
 
     def __init__(self, config: ModumixConfig):
         super().__init__(config)
-        self.config = config
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
 
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
-        self.expert_manager = ExpertManager()
-        self.router = ModuMixRouter(config.hidden_size, config.num_experts)
         self.layers = nn.ModuleList(
             [ModumixDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
         )
@@ -966,38 +971,6 @@ class ModumixModel(ModumixPreTrainedModel):
         return_dict: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
     ) -> Union[Tuple, MoeModelOutputWithPast]:
-        """
-        Forward pass for the ModuMixModel incorporating routing to experts and an optional common expert.
-
-        Args:
-            input_ids (`torch.LongTensor` of shape `(batch_size, sequence_length)`):
-                Indices of input sequence tokens in the vocabulary.
-            attention_mask (`torch.Tensor` of shape `(batch_size, sequence_length)`, *optional*):
-                Mask to avoid performing attention on padding token indices.
-            position_ids (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
-                Indices of positions of each input sequence tokens in the position embeddings.
-            past_key_values (`List[torch.FloatTensor]`, *optional*):
-                Cached past key and value projection states.
-            inputs_embeds (`torch.FloatTensor` of shape `(batch_size, sequence_length, hidden_size)`, *optional*):
-                Embedded representations of the input tokens.
-            use_cache (`bool`, *optional*):
-                If `True`, past key values are returned and can be used to speed up decoding.
-            output_attentions (`bool`, *optional*):
-                Whether or not to return the attentions tensors of all attention layers.
-            output_hidden_states (`bool`, *optional*):
-                Whether or not to return the hidden states of all layers.
-            output_router_logits (`bool`, *optional*):
-                Whether or not to return the logits of all the routers.
-            return_dict (`bool`, *optional*):
-                Whether or not to return a [`~utils.ModelOutput`] instead of a plain tuple.
-            cache_position (`torch.LongTensor` of shape `(sequence_length)`, *optional*):
-                Indices depicting the position of the input sequence tokens in the sequence.
-
-        Returns:
-            [`MoeModelOutputWithPast`] or `Tuple`: Returns a [`MoeModelOutputWithPast`] if `return_dict=True`, otherwise a tuple.
-        """
-
-        # Set defaults from config if not provided
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_router_logits = (
             output_router_logits if output_router_logits is not None else self.config.output_router_logits
@@ -1006,13 +979,12 @@ class ModumixModel(ModumixPreTrainedModel):
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
         use_cache = use_cache if use_cache is not None else self.config.use_cache
+
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
-        # Ensure only one of input_ids or inputs_embeds is provided
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
 
-        # Handle gradient checkpointing compatibility
         if self.gradient_checkpointing and self.training:
             if use_cache:
                 logger.warning_once(
@@ -1020,7 +992,7 @@ class ModumixModel(ModumixPreTrainedModel):
                 )
                 use_cache = False
 
-        # Handle legacy cache formats
+        # kept for BC (non `Cache` `past_key_values` inputs)
         return_legacy_cache = False
         if use_cache and not isinstance(past_key_values, Cache):
             return_legacy_cache = True
@@ -1034,11 +1006,9 @@ class ModumixModel(ModumixPreTrainedModel):
                     "(https://huggingface.co/docs/transformers/kv_cache#legacy-cache-format)"
                 )
 
-        # Obtain embeddings from input_ids or inputs_embeds
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
 
-        # Generate cache_position if not provided
         if cache_position is None:
             past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
             cache_position = torch.arange(
@@ -1047,44 +1017,13 @@ class ModumixModel(ModumixPreTrainedModel):
         if position_ids is None:
             position_ids = cache_position.unsqueeze(0)
 
-        # Create causal mask for attention
         causal_mask = self._update_causal_mask(
             attention_mask, inputs_embeds, cache_position, past_key_values, output_attentions
         )
 
         hidden_states = inputs_embeds
 
-        # ============================
-        # Routing to Experts
-        # ============================
-        if hasattr(self, 'router') and self.router is not None:
-            # Obtain routing probabilities from the router
-            routing_probs = self.router(hidden_states)  # Shape: (batch_size, seq_length, num_experts)
-
-            # Select the expert with the highest probability for each token
-            selected_expert_indices = routing_probs.argmax(dim=-1)  # Shape: (batch_size, seq_length)
-
-            # Route embeddings to the selected experts using ExpertManager
-            expert_outputs = self.expert_manager(hidden_states, selected_expert_indices)  # Shape: (batch_size, seq_length, hidden_size)
-
-            # ============================
-            # Common Expert Processing
-            # ============================
-            if self.config.use_common_expert and hasattr(self, 'common_expert') and self.common_expert is not None:
-                # Pass embeddings through the common expert
-                common_output = self.common_expert(hidden_states)  # Shape: (batch_size, seq_length, hidden_size)
-
-                # Combine expert outputs with common expert outputs (e.g., summation)
-                hidden_states = expert_outputs + common_output
-            else:
-                hidden_states = expert_outputs
-        else:
-            # If no router is present, proceed without expert routing
-            hidden_states = hidden_states
-
-        # ============================
-        # Passing through Decoder Layers
-        # ============================
+        # decoder layers
         all_hidden_states = () if output_hidden_states else None
         all_self_attns = () if output_attentions else None
         all_router_logits = () if output_router_logits else None
@@ -1095,7 +1034,6 @@ class ModumixModel(ModumixPreTrainedModel):
                 all_hidden_states += (hidden_states,)
 
             if self.gradient_checkpointing and self.training:
-                # Use gradient checkpointing for memory efficiency
                 layer_outputs = self._gradient_checkpointing_func(
                     decoder_layer.__call__,
                     hidden_states,
@@ -1108,7 +1046,6 @@ class ModumixModel(ModumixPreTrainedModel):
                     cache_position,
                 )
             else:
-                # Standard forward pass through the decoder layer
                 layer_outputs = decoder_layer(
                     hidden_states,
                     attention_mask=causal_mask,
@@ -1131,26 +1068,22 @@ class ModumixModel(ModumixPreTrainedModel):
             if output_router_logits:
                 all_router_logits += (layer_outputs[-1],)
 
-        # Apply final normalization
         hidden_states = self.norm(hidden_states)
 
-        # Add hidden states from the last decoder layer
+        # add hidden states from the last decoder layer
         if output_hidden_states:
             all_hidden_states += (hidden_states,)
 
-        # Handle cache for next steps
         next_cache = next_decoder_cache if use_cache else None
         if return_legacy_cache:
             next_cache = next_cache.to_legacy_cache()
 
-        # Prepare the output
         if not return_dict:
             return tuple(
                 v
                 for v in [hidden_states, next_cache, all_hidden_states, all_self_attns, all_router_logits]
                 if v is not None
             )
-
         return MoeModelOutputWithPast(
             last_hidden_state=hidden_states,
             past_key_values=next_cache,
@@ -1158,7 +1091,6 @@ class ModumixModel(ModumixPreTrainedModel):
             attentions=all_self_attns,
             router_logits=all_router_logits,
         )
-
 
     # Copied from transformers.models.phi3.modeling_phi3.Phi3Model._update_causal_mask
     def _update_causal_mask(
@@ -1375,9 +1307,9 @@ class ModumixForCausalLM(ModumixPreTrainedModel, GenerationMixin):
 
         ```python
         >>> from transformers import AutoTokenizer, ModumixForCausalLM
-        
-        >>> model = ModumixForCausalLM.from_pretrained("model_name")
-        >>> tokenizer = AutoTokenizer.from_pretrained("model_name")
+
+        >>> model = ModumixForCausalLM.from_pretrained("mistralai/Modumix-8x7B-v0.1")
+        >>> tokenizer = AutoTokenizer.from_pretrained("mistralai/Modumix-8x7B-v0.1")
 
         >>> prompt = "Hey, are you conscious? Can you talk to me?"
         >>> inputs = tokenizer(prompt, return_tensors="pt")
@@ -1464,7 +1396,7 @@ class ModumixForCausalLM(ModumixPreTrainedModel, GenerationMixin):
     """,
     MODUMIX_START_DOCSTRING,
 )
-# Copied from transformers.models.llama.modeling_llama.LlamaForSequenceClassification with Llama->Modumix, LLAMA->MODUMIX
+# Copied from transformers.models.mixtral.modeling_mixtral.MixtralForSequenceClassification with Mixtral->Modumix, MIXTRAL->MODUMIX
 class ModumixForSequenceClassification(ModumixPreTrainedModel):
     def __init__(self, config):
         super().__init__(config)
@@ -1561,7 +1493,7 @@ class ModumixForSequenceClassification(ModumixPreTrainedModel):
     """,
     MODUMIX_START_DOCSTRING,
 )
-# Copied from transformers.models.llama.modeling_llama.LlamaForTokenClassification with Llama->Modumix, LLAMA->MODUMIX
+# Copied from transformers.models.mixtral.modeling_mixtral.MixtralForTokenClassification with Mixtral->Modumix, MIXTRAL->MODUMIX
 class ModumixForTokenClassification(ModumixPreTrainedModel):
     def __init__(self, config):
         super().__init__(config)

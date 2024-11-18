@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2023 Mixtral AI and the HuggingFace Inc. team. All rights reserved.
+# Copyright 2023 All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,10 +12,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Mixtral model configuration"""
+"""Modumix model configuration"""
 
-from ...configuration_utils import PretrainedConfig
-from ...utils import logging
+from transformers.configuration_utils import PretrainedConfig
+from transformers.utils import logging
 
 
 logger = logging.get_logger(__name__)
@@ -23,12 +23,9 @@ logger = logging.get_logger(__name__)
 
 class ModumixConfig(PretrainedConfig):
     r"""
-    This is the configuration class to store the configuration of a [`MixtralModel`]. It is used to instantiate an
-    Mixtral model according to the specified arguments, defining the model architecture. Instantiating a configuration
-    with the defaults will yield a similar configuration to that of the Mixtral-7B-v0.1 or Mixtral-7B-Instruct-v0.1.
+    This is the configuration class to store the configuration of a [`ModumixModel`]. It is used to instantiate a
+    Modumix model according to the specified arguments, defining the model architecture. 
 
-    [mixtralai/Mixtral-8x7B](https://huggingface.co/mixtralai/Mixtral-8x7B)
-    [mixtralai/Mixtral-7B-Instruct-v0.1](https://huggingface.co/mixtralai/Mixtral-7B-Instruct-v0.1)
 
     Configuration objects inherit from [`PretrainedConfig`] and can be used to control the model outputs. Read the
     documentation from [`PretrainedConfig`] for more information.
@@ -36,8 +33,8 @@ class ModumixConfig(PretrainedConfig):
 
     Args:
         vocab_size (`int`, *optional*, defaults to 32000):
-            Vocabulary size of the Mixtral model. Defines the number of different tokens that can be represented by the
-            `inputs_ids` passed when calling [`MixtralModel`]
+            Vocabulary size of the Modumix model. Defines the number of different tokens that can be represented by the
+            `inputs_ids` passed when calling [`ModumixModel`]
         hidden_size (`int`, *optional*, defaults to 4096):
             Dimension of the hidden representations.
         intermediate_size (`int`, *optional*, defaults to 14336):
@@ -56,7 +53,7 @@ class ModumixConfig(PretrainedConfig):
         hidden_act (`str` or `function`, *optional*, defaults to `"silu"`):
             The non-linear activation function (function or string) in the decoder.
         max_position_embeddings (`int`, *optional*, defaults to `4096*32`):
-            The maximum sequence length that this model might ever be used with. Mixtral's sliding window attention
+            The maximum sequence length that this model might ever be used with. Modumix's sliding window attention
             allows sequence of up to 4096*32 tokens.
         initializer_range (`float`, *optional*, defaults to 0.02):
             The standard deviation of the truncated_normal_initializer for initializing all weight matrices.
@@ -91,15 +88,20 @@ class ModumixConfig(PretrainedConfig):
             The aux loss factor for the total loss.
         router_jitter_noise (`float`, *optional*, defaults to 0.0):
             Amount of noise to add to the router.
+        use_common_expert (`bool`, *optional*, defaults to `False`):
+            Whether or not to include a common expert that processes every input sequence.
+        aggregation_method (`str`, *optional*, defaults to `"sum"`):
+            Method to aggregate the outputs of the selected expert(s) and the common expert.
+            Options are `"sum"`, `"mean"`, and `"learned"` (for a learnable aggregation layer).
 
     ```python
-    >>> from transformers import MixtralModel, MixtralConfig
+    >>> from transformers import ModumixModel, ModumixConfig
 
-    >>> # Initializing a Mixtral 7B style configuration
-    >>> configuration = MixtralConfig()
+    >>> # Initializing a Modumix 7B style configuration
+    >>> configuration = ModumixConfig()
 
-    >>> # Initializing a model from the Mixtral 7B style configuration
-    >>> model = MixtralModel(configuration)
+    >>> # Initializing a model from the Modumix 7B style configuration
+    >>> model = ModumixModel(configuration)
 
     >>> # Accessing the model configuration
     >>> configuration = model.config
@@ -134,6 +136,8 @@ class ModumixConfig(PretrainedConfig):
         output_router_logits=False,
         router_aux_loss_coef=0.001,
         router_jitter_noise=0.0,
+        use_common_expert=False,
+        aggregation_method="learned",
         **kwargs,
     ):
         self.vocab_size = vocab_size
@@ -162,6 +166,9 @@ class ModumixConfig(PretrainedConfig):
         self.output_router_logits = output_router_logits
         self.router_aux_loss_coef = router_aux_loss_coef
         self.router_jitter_noise = router_jitter_noise
+        self.use_common_expert = use_common_expert
+        self.aggregation_method = aggregation_method
+
         super().__init__(
             pad_token_id=pad_token_id,
             bos_token_id=bos_token_id,
