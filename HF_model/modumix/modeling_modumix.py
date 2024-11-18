@@ -583,6 +583,14 @@ MODUMIX_ATTENTION_CLASSES = {
 
 
 class ModumixBlockSparseTop2MLP(nn.Module):
+    # TODO: implement Self-Gating Mechanism in Experts
+    # where all experts receive the same input and the gating mechanism is 
+    # a  a small neural network or a gating layer within each expert that 
+    # computes a scalar gating score representing the expert's confidence
+    # or relevance to the input.
+    # then, when we receive the output of the experts, we can use the gating
+    # scores to aggregate the outputs of the experts, or decide which expert
+    # to use for each token/sequence.
     def __init__(self, config: ModumixConfig):
         super().__init__()
         self.ffn_dim = config.intermediate_size
