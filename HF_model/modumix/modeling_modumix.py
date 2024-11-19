@@ -1277,6 +1277,19 @@ class ModumixForCausalLM(ModumixPreTrainedModel, GenerationMixin):
     def get_decoder(self):
         return self.model
 
+    def prepare_inputs_for_generation(self, input_ids, past_key_values=None, attention_mask=None, **kwargs):
+        # Prepare the inputs for the next generation step
+        if past_key_values:
+            # Use only the last token if past key values are available
+            input_ids = input_ids[:, -1:]
+
+        return {
+            "input_ids": input_ids,
+            "past_key_values": past_key_values,
+            "attention_mask": attention_mask,
+            **kwargs
+        }
+    
     @add_start_docstrings_to_model_forward(MODUMIX_INPUTS_DOCSTRING)
     @replace_return_docstrings(output_type=MoeCausalLMOutputWithPast, config_class=_CONFIG_FOR_DOC)
     # Ignore copy
